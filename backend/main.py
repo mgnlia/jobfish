@@ -1,12 +1,10 @@
-"""JobFish — Autonomous Job Application Agent powered by TinyFish Web Agent API"""
 import asyncio
 import json
 import os
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import Optional, AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -14,33 +12,40 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-DB_PATH = os.getenv("DB_PATH", "jobfish.db")
 TINYFISH_API_KEY = os.getenv("TINYFISH_API_KEY", "")
 TINYFISH_URL = "https://agent.tinyfish.ai/v1/automation/run-sse"
+DB_PATH = os.getenv("DB_PATH", "jobfish.db")
 
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
 
 def init_db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("""CREATE TABLE IF NOT EXISTS applications (
-        id TEXT PRIMARY KEY,
-        status TEXT,
-        job_url TEXT,
-        job_title TEXT,
-        company TEXT,
-        applicant TEXT,
-        created_at TEXT,
-        result TEXT,
-        error TEXT
-    )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS job_searches (
-        id TEXT PRIMARY KEY,
-        board TEXT,
-        query TEXT,
-        created_at TEXT,
-        results TEXT
-    )""")
-    con.commit()
-    con.close()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            company TEXT,
+            location TEXT,
+            apply_url TEXT,
+            board TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS applications (
+            id TEXT PRIMARY KEY,
+            job_id TEXT,
+            status TEXT DEFAULT 'pending',
+            streaming_url TEXT,
+            result_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 
 @asynccontextmanager
@@ -49,7 +54,8 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="JobFish API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="JobFish API", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,58 +65,69 @@ app.add_middleware(
 )
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
-class ResumeProfile(BaseModel):
-    full_name: str
-    email: str
-    phone: str
-    location: str
-    linkedin_url: Optional[str] = None
-    github_url: Optional[str] = None
-    years_experience: int
-    skills: list[str]
-    summary: str
-    education: str
-    most_recent_role: str
-    most_recent_company: str
+class SearchRequest(BaseModel):
+    query: str
+    location: str = "Remote"
+    boards: list[str] = ["linkedin", "indeed"]
 
 
-class JobPreferences(BaseModel):
-    job_titles: list[str]
-    locations: list[str]
-    remote_ok: bool = True
-    min_salary: Optional[int] = None
-    job_boards: list[str] = ["greenhouse", "lever", "indeed"]
-    max_applications: int = 5
+class ApplyRequest(BaseModel):
+    job_id: str
+    job_url: str
+    resume_data: dict
 
 
-class ApplicationRequest(BaseModel):
-    profile: ResumeProfile
-    preferences: JobPreferences
-    job_url: Optional[str] = None
+# ---------------------------------------------------------------------------
+# Mock data (used when TINYFISH_API_KEY is not set)
+# ---------------------------------------------------------------------------
+
+MOCK_JOBS = [
+    {"id": str(uuid.uuid4()), "title": "Senior Software Engineer", "company": "Acme Corp", "location": "Remote", "apply_url": "https://example.com/apply/1", "board": "linkedin"},
+    {"id": str(uuid.uuid4()), "title": "Full Stack Developer", "company": "TechStart", "location": "San Francisco, CA", "apply_url": "https://example.com/apply/2", "board": "indeed"},
+    {"id": str(uuid.uuid4()), "title": "Backend Engineer (Python)", "company": "DataFlow", "location": "New York, NY", "apply_url": "https://example.com/apply/3", "board": "linkedin"},
+    {"id": str(uuid.uuid4()), "title": "AI/ML Engineer", "company": "NeuralWorks", "location": "Remote", "apply_url": "https://example.com/apply/4", "board": "greenhouse"},
+]
 
 
-class JobSearchRequest(BaseModel):
-    preferences: JobPreferences
+async def mock_sse_stream(events: list[dict]) -> AsyncGenerator[str, None]:
+    for event in events:
+        yield f"data: {json.dumps(event)}\n\n"
+        await asyncio.sleep(0.3)
 
 
-# ── TinyFish SSE streaming ────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# TinyFish helpers
+# ---------------------------------------------------------------------------
 
-async def tinyfish_stream(url: str, goal: str) -> AsyncGenerator[dict, None]:
-    """Stream SSE events from TinyFish Web Agent API."""
+async def call_tinyfish_sse(url: str, goal: str) -> AsyncGenerator[dict, None]:
+    """Stream SSE events from TinyFish API."""
     if not TINYFISH_API_KEY:
-        raise HTTPException(500, "TINYFISH_API_KEY not configured")
-    async with httpx.AsyncClient(timeout=300) as client:
+        # Mock mode
+        mock_events = [
+            {"event": "STARTED", "runId": str(uuid.uuid4())},
+            {"event": "STREAMING_URL", "streamingUrl": "https://example.com/stream/mock"},
+            {"event": "PROGRESS", "message": "Navigating to job board..."},
+            {"event": "PROGRESS", "message": "Extracting job listings..."},
+            {"event": "COMPLETE", "resultJson": json.dumps(MOCK_JOBS[:2])},
+        ]
+        for event in mock_events:
+            yield event
+            await asyncio.sleep(0.2)
+        return
+
+    async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream(
-            "POST", TINYFISH_URL,
+            "POST",
+            TINYFISH_URL,
             headers={"X-API-Key": TINYFISH_API_KEY, "Content-Type": "application/json"},
-            json={"url": url, "goal": goal, "proxy_config": {"enabled": True}},
-        ) as r:
-            if r.status_code != 200:
-                body = await r.aread()
-                raise HTTPException(r.status_code, f"TinyFish error: {body.decode()}")
-            async for line in r.aiter_lines():
+            json={"url": url, "goal": goal},
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
                 if line.startswith("data: "):
                     try:
                         yield json.loads(line[6:])
@@ -118,204 +135,117 @@ async def tinyfish_stream(url: str, goal: str) -> AsyncGenerator[dict, None]:
                         pass
 
 
-# ── Goal builders ─────────────────────────────────────────────────────────────
-
-def build_search_goal(p: JobPreferences) -> str:
-    titles = ", ".join(p.job_titles)
-    locs = ", ".join(p.locations)
-    remote = "Remote OK" if p.remote_ok else "On-site only"
-    salary = f"\n- Minimum salary: ${p.min_salary:,}" if p.min_salary else ""
-    return f"""Search for job openings matching these criteria:
-- Job titles: {titles}
-- Locations: {locs}
-- Work arrangement: {remote}{salary}
-
-For each job found, extract and return as a JSON array of objects with fields:
-  title, company, location, application_url, description (1 sentence), posted_date
-
-Find up to {p.max_applications} relevant positions. Return ONLY a valid JSON array."""
-
-
-def build_apply_goal(profile: ResumeProfile, title: str, company: str) -> str:
-    skills = ", ".join(profile.skills[:8])
-    linkedin = f"\n- LinkedIn: {profile.linkedin_url}" if profile.linkedin_url else ""
-    github = f"\n- GitHub: {profile.github_url}" if profile.github_url else ""
-    return f"""Apply for the {title} position at {company}.
-
-Fill the application form with these details:
-- Full Name: {profile.full_name}
-- Email: {profile.email}
-- Phone: {profile.phone}
-- Location: {profile.location}{linkedin}{github}
-- Years of Experience: {profile.years_experience}
-- Current/Most Recent Role: {profile.most_recent_role} at {profile.most_recent_company}
-- Key Skills: {skills}
-
-For cover letter or "tell us about yourself" fields, use:
-"{profile.summary}"
-
-Education: {profile.education}
-
-Steps:
-1. Navigate to the application form
-2. Fill ALL required fields with the data above
-3. Leave optional unlisted fields blank
-4. Review and click Submit/Apply
-5. Return JSON: {{ "success": bool, "confirmation_id": "...", "message": "..." }}
-
-STOP and report if you encounter a CAPTCHA or mandatory login wall."""
-
-
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "JobFish", "version": "1.0.0"}
+    return {"status": "ok", "mock_mode": not bool(TINYFISH_API_KEY)}
 
 
 @app.post("/api/search-jobs")
-async def search_jobs(req: JobSearchRequest):
-    """Search a job board for matching positions using TinyFish agent."""
-    board_urls = {
-        "greenhouse": "https://boards.greenhouse.io",
-        "lever": "https://jobs.lever.co",
-        "indeed": "https://www.indeed.com/jobs",
-        "linkedin": "https://www.linkedin.com/jobs/search",
-        "workday": "https://www.myworkdayjobs.com",
-    }
-    board = req.preferences.job_boards[0] if req.preferences.job_boards else "indeed"
-    url = board_urls.get(board, "https://www.indeed.com/jobs")
-    search_id = str(uuid.uuid4())
-    results = []
-
-    async for event in tinyfish_stream(url, build_search_goal(req.preferences)):
-        if event.get("type") == "COMPLETE" and event.get("status") == "COMPLETED":
-            r = event.get("resultJson", [])
-            results = r if isinstance(r, list) else r.get("jobs", []) if isinstance(r, dict) else []
-
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT INTO job_searches VALUES (?,?,?,?,?)",
-        (search_id, board, ", ".join(req.preferences.job_titles),
-         datetime.utcnow().isoformat(), json.dumps(results)),
+async def search_jobs(req: SearchRequest):
+    """Search job boards via TinyFish and return structured listings."""
+    boards_str = ", ".join(req.boards)
+    goal = (
+        f"Search for '{req.query}' jobs in '{req.location}' on {boards_str}. "
+        "Extract title, company, location, and direct apply link as a JSON array."
     )
-    con.commit()
-    con.close()
-    return {"search_id": search_id, "board": board, "jobs": results, "count": len(results)}
+    target_url = f"https://www.linkedin.com/jobs/search/?keywords={req.query.replace(' ', '+')}&location={req.location.replace(' ', '+')}"
+
+    jobs = []
+    run_id = None
+    streaming_url = None
+
+    async for event in call_tinyfish_sse(target_url, goal):
+        etype = event.get("event")
+        if etype == "STARTED":
+            run_id = event.get("runId", str(uuid.uuid4()))
+        elif etype == "STREAMING_URL":
+            streaming_url = event.get("streamingUrl")
+        elif etype == "COMPLETE":
+            result = event.get("resultJson", "[]")
+            try:
+                raw = json.loads(result) if isinstance(result, str) else result
+                if isinstance(raw, list):
+                    jobs = raw
+            except Exception:
+                jobs = MOCK_JOBS
+
+    # Persist to DB
+    conn = sqlite3.connect(DB_PATH)
+    for job in jobs:
+        jid = job.get("id") or str(uuid.uuid4())
+        conn.execute(
+            "INSERT OR REPLACE INTO jobs (id, title, company, location, apply_url, board) VALUES (?,?,?,?,?,?)",
+            (jid, job.get("title",""), job.get("company",""), job.get("location",""), job.get("apply_url",""), job.get("board", boards_str)),
+        )
+    conn.commit()
+    conn.close()
+
+    return {"run_id": run_id, "streaming_url": streaming_url, "jobs": jobs, "mock_mode": not bool(TINYFISH_API_KEY)}
 
 
 @app.post("/api/apply")
-async def apply_to_job(req: ApplicationRequest):
-    """Apply to a specific job URL. Streams SSE progress events."""
-    if not req.job_url:
-        raise HTTPException(400, "job_url is required")
-
-    job_id = str(uuid.uuid4())
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT INTO applications VALUES (?,?,?,?,?,?,?,?,?)",
-        (job_id, "running", req.job_url, "", "", req.profile.full_name,
-         datetime.utcnow().isoformat(), None, None),
-    )
-    con.commit()
-    con.close()
-
-    goal = build_apply_goal(req.profile, "the position", "the company")
-
-    async def stream():
-        yield f"data: {json.dumps({'type': 'JOB_STARTED', 'jobId': job_id})}\n\n"
-        try:
-            async for event in tinyfish_stream(req.job_url, goal):
-                yield f"data: {json.dumps(event)}\n\n"
-                if event.get("type") == "COMPLETE":
-                    ok = event.get("status") == "COMPLETED"
-                    c = sqlite3.connect(DB_PATH)
-                    c.execute(
-                        "UPDATE applications SET status=?, result=? WHERE id=?",
-                        ("completed" if ok else "failed", json.dumps(event.get("resultJson")), job_id),
-                    )
-                    c.commit()
-                    c.close()
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'ERROR', 'message': str(e)})}\n\n"
-            c = sqlite3.connect(DB_PATH)
-            c.execute("UPDATE applications SET status='error', error=? WHERE id=?", (str(e), job_id))
-            c.commit()
-            c.close()
-
-    return StreamingResponse(
-        stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+async def apply_to_job(req: ApplyRequest):
+    """Use TinyFish agent to fill out a job application form."""
+    resume = req.resume_data
+    goal = (
+        f"Fill out the job application form at this URL. "
+        f"Applicant name: {resume.get('name', 'Jane Doe')}. "
+        f"Email: {resume.get('email', 'applicant@example.com')}. "
+        f"Phone: {resume.get('phone', '555-0100')}. "
+        f"Submit the form when complete and return the confirmation details."
     )
 
+    app_id = str(uuid.uuid4())
+    streaming_url = None
+    result = None
 
-@app.post("/api/autopilot")
-async def autopilot(req: ApplicationRequest):
-    """Full autopilot: search for jobs then apply to each. Streams SSE progress."""
-    session_id = str(uuid.uuid4())
-    board_urls = {
-        "greenhouse": "https://boards.greenhouse.io",
-        "lever": "https://jobs.lever.co",
-        "indeed": "https://www.indeed.com/jobs",
-        "linkedin": "https://www.linkedin.com/jobs/search",
-    }
+    async for event in call_tinyfish_sse(req.job_url, goal):
+        etype = event.get("event")
+        if etype == "STREAMING_URL":
+            streaming_url = event.get("streamingUrl")
+        elif etype == "COMPLETE":
+            result = event.get("resultJson")
 
-    async def stream():
-        yield f"data: {json.dumps({'type': 'SESSION_STARTED', 'sessionId': session_id})}\n\n"
-
-        board = req.preferences.job_boards[0] if req.preferences.job_boards else "indeed"
-        search_url = board_urls.get(board, "https://www.indeed.com/jobs")
-        yield f"data: {json.dumps({'type': 'SEARCHING', 'board': board})}\n\n"
-
-        found = []
-        try:
-            async for event in tinyfish_stream(search_url, build_search_goal(req.preferences)):
-                yield f"data: {json.dumps({'type': 'SEARCH_PROGRESS', 'event': event})}\n\n"
-                if event.get("type") == "COMPLETE" and event.get("status") == "COMPLETED":
-                    r = event.get("resultJson", [])
-                    found = r if isinstance(r, list) else r.get("jobs", []) if isinstance(r, dict) else []
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'SEARCH_ERROR', 'message': str(e)})}\n\n"
-            return
-
-        yield f"data: {json.dumps({'type': 'JOBS_FOUND', 'count': len(found), 'jobs': found})}\n\n"
-
-        if not found:
-            yield f"data: {json.dumps({'type': 'COMPLETE', 'status': 'NO_JOBS_FOUND'})}\n\n"
-            return
-
-        applied = 0
-        for i, job in enumerate(found[: req.preferences.max_applications]):
-            job_url = job.get("application_url") or job.get("url", "")
-            if not job_url:
-                continue
-            title = job.get("title", "Position")
-            company = job.get("company", "Company")
-            yield f"data: {json.dumps({'type': 'APPLYING', 'jobIndex': i + 1, 'jobTitle': title, 'company': company})}\n\n"
-            try:
-                async for event in tinyfish_stream(job_url, build_apply_goal(req.profile, title, company)):
-                    yield f"data: {json.dumps({'type': 'APP_PROGRESS', 'jobIndex': i + 1, 'event': event})}\n\n"
-                    if event.get("type") == "COMPLETE":
-                        ok = event.get("status") == "COMPLETED"
-                        if ok:
-                            applied += 1
-                        yield f"data: {json.dumps({'type': 'APP_DONE', 'jobIndex': i + 1, 'success': ok, 'result': event.get('resultJson')})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'type': 'APP_ERROR', 'jobIndex': i + 1, 'message': str(e)})}\n\n"
-            await asyncio.sleep(2)
-
-        yield f"data: {json.dumps({'type': 'SESSION_COMPLETE', 'applied': applied, 'attempted': min(req.preferences.max_applications, len(found))})}\n\n"
-
-    return StreamingResponse(
-        stream(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    # Persist application
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO applications (id, job_id, status, streaming_url, result_json) VALUES (?,?,?,?,?)",
+        (app_id, req.job_id, "submitted", streaming_url, json.dumps(result)),
     )
+    conn.commit()
+    conn.close()
+
+    return {"application_id": app_id, "status": "submitted", "streaming_url": streaming_url, "result": result, "mock_mode": not bool(TINYFISH_API_KEY)}
+
+
+@app.get("/api/status/{run_id}")
+async def stream_status(run_id: str):
+    """SSE endpoint — streams TinyFish events to frontend for a given run."""
+    async def event_generator():
+        # In production, retrieve the stored streaming_url for run_id and proxy events.
+        # For now, emit a status heartbeat.
+        yield f"data: {json.dumps({'run_id': run_id, 'status': 'active'})}\n\n"
+        await asyncio.sleep(1)
+        yield f"data: {json.dumps({'run_id': run_id, 'status': 'complete'})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.get("/api/applications")
 async def list_applications():
-    con = sqlite3.connect(DB_PATH)
-    rows = con.execute("SELECT * FROM applications ORDER BY created_at DESC").fetchall()
-    con.close()
-    keys = ["id", "status", "job_url", "job_title", "company", "applicant", "created_at", "result", "error"]
-    return {"applications": [dict(zip(keys, r)) for r in rows]}
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT id, job_id, status, streaming_url, created_at FROM applications ORDER BY created_at DESC LIMIT 50").fetchall()
+    conn.close()
+    return [{"id": r[0], "job_id": r[1], "status": r[2], "streaming_url": r[3], "created_at": r[4]} for r in rows]
+
+
+@app.get("/api/jobs")
+async def list_jobs():
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT id, title, company, location, apply_url, board, created_at FROM jobs ORDER BY created_at DESC LIMIT 100").fetchall()
+    conn.close()
+    return [{"id": r[0], "title": r[1], "company": r[2], "location": r[3], "apply_url": r[4], "board": r[5], "created_at": r[6]} for r in rows]
