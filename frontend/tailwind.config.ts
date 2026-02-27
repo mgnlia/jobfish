@@ -9,11 +9,11 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        fish: {
-          50: "#f0f9ff",
-          500: "#0ea5e9",
-          600: "#0284c7",
-          900: "#0c4a6e",
+        brand: {
+          50: "#eff6ff",
+          500: "#3b82f6",
+          600: "#2563eb",
+          700: "#1d4ed8",
         },
       },
     },
