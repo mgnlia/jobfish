@@ -1,2 +1,1 @@
-// This file intentionally left blank — see postcss.config.js
-export default {};
+// DEPRECATED: use postcss.config.js instead
