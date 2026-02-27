@@ -1,4 +1,6 @@
 {
+  "rootDirectory": "frontend",
+  "framework": "nextjs",
   "rewrites": [
     {
       "source": "/api/:path*",
