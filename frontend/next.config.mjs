@@ -1,3 +1,1 @@
-/** @type {import('next').NextConfig} */
-const nextConfig = {};
-export default nextConfig;
+// DEPRECATED: use next.config.js instead
